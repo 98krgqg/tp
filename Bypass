@@ -1,0 +1,871 @@
+
+-- 服务
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+
+-- 本地玩家
+local LocalPlayer = Players.LocalPlayer
+local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
+
+-- 配置 (可自定义)
+local Config = {
+    TeleportSpeed = 200,         -- 传送速度 (越大越快)
+    TeleportHeight = 3,          -- 高度偏移
+    Smoothness = 0.15,           -- 平滑度 (0-1, 越小越平滑)
+    UpdateRate = 0.016,          -- 更新频率 (秒)
+    ShowDistance = true,         -- 显示距离
+    AutoRespawn = true,          -- 自动重生后重新开始
+    UseCFrameMethod = true,      -- 使用CFrame方法 (更稳定)
+    DebugMode = false           -- 调试模式
+}
+
+-- 状态变量
+local Teleporting = false
+local TargetPlayer = nil
+local PlayersList = {}
+local CurrentIndex = 1
+local UI = nil
+local MainLoop = nil
+local UIFolded = false -- UI收起/展开状态
+
+-- 工具函数
+local function PrintDebug(msg)
+    if Config.DebugMode then
+        print("[传送调试]: " .. msg)
+    end
+end
+
+local function ShowNotification(title, text, duration)
+    game:GetService("StarterGui"):SetCore("SendNotification", {
+        Title = title,
+        Text = text,
+        Duration = duration or 3,
+        Icon = "rbxassetid://4483345998"
+    })
+end
+
+-- 计算玩家间的距离
+local function GetDistance(player1, player2)
+    if not player1.Character or not player2.Character then
+        return math.huge
+    end
+    
+    local hrp1 = player1.Character:FindFirstChild("HumanoidRootPart")
+    local hrp2 = player2.Character:FindFirstChild("HumanoidRootPart")
+    
+    if not hrp1 or not hrp2 then
+        return math.huge
+    end
+    
+    return (hrp1.Position - hrp2.Position).Magnitude
+end
+
+-- 获取所有在线玩家（排除自己）
+local function GetOnlinePlayers()
+    local players = {}
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            table.insert(players, player)
+        end
+    end
+    return players
+end
+
+-- 快速平滑传送函数 (改进版)
+local function FastSmoothTeleport(targetCFrame)
+    if not HumanoidRootPart then return end
+    
+    local startCFrame = HumanoidRootPart.CFrame
+    local startTime = tick()
+    local duration = (targetCFrame.Position - startCFrame.Position).Magnitude / Config.TeleportSpeed
+    
+    -- 确保最小持续时间
+    duration = math.max(duration, 0.1)
+    
+    -- 快速平滑移动 (使用线性插值 + 缓动)
+    local t = 0
+    while t < 1 and Teleporting do
+        t = (tick() - startTime) / duration
+        
+        -- 使用立方缓动函数获得更平滑的开始和结束
+        local easeT = t * t * (3 - 2 * t)
+        
+        -- 线性插值位置和朝向
+        local newPosition = startCFrame.Position:Lerp(targetCFrame.Position, easeT)
+        local newLookVector = startCFrame.LookVector:Lerp(targetCFrame.LookVector, easeT)
+        
+        -- 设置新的CFrame
+        HumanoidRootPart.CFrame = CFrame.new(newPosition, newPosition + newLookVector)
+        
+        RunService.RenderStepped:Wait()
+    end
+    
+    -- 最终位置
+    if Teleporting then
+        HumanoidRootPart.CFrame = targetCFrame
+    end
+end
+
+-- 更快的直线传送 (无平滑效果)
+local function DirectTeleport(targetCFrame)
+    if not HumanoidRootPart then return end
+    HumanoidRootPart.CFrame = targetCFrame
+end
+
+-- 带预测的快速传送 (最快)
+local function PredictiveTeleport(targetPlayer)
+    if not HumanoidRootPart or not targetPlayer.Character then return end
+    
+    local targetHRP = targetPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not targetHRP then return end
+    
+    -- 计算目标速度 (如果可用)
+    local targetVelocity = Vector3.new(0, 0, 0)
+    if targetHRP:FindFirstChild("Velocity") then
+        targetVelocity = targetHRP.Velocity
+    end
+    
+    -- 预测位置 (基于速度和更新时间)
+    local predictionTime = Config.UpdateRate * 2
+    local predictedPosition = targetHRP.Position + (targetVelocity * predictionTime)
+    
+    -- 添加高度偏移
+    predictedPosition = predictedPosition + Vector3.new(0, Config.TeleportHeight, 0)
+    
+    -- 直接传送到预测位置
+    HumanoidRootPart.CFrame = CFrame.new(predictedPosition, predictedPosition + Vector3.new(0, 0, 1))
+end
+
+-- 传送循环主函数
+local function TeleportLoop()
+    while Teleporting and RunService.Heartbeat:Wait() do
+        if not TargetPlayer or not TargetPlayer.Character then
+            PrintDebug("目标丢失")
+            break
+        end
+        
+        local targetChar = TargetPlayer.Character
+        local targetHRP = targetChar:FindFirstChild("HumanoidRootPart")
+        
+        if not targetHRP then
+            task.wait(0.1)
+            continue
+        end
+        
+        -- 计算目标CFrame
+        local targetPosition = targetHRP.Position + Vector3.new(0, Config.TeleportHeight, 0)
+        local lookVector = (targetPosition - HumanoidRootPart.Position).Unit
+        local targetCFrame = CFrame.new(targetPosition, targetPosition + lookVector)
+        
+        -- 选择传送方法
+        if Config.UseCFrameMethod then
+            -- 方法1: 直接传送 (最快)
+            DirectTeleport(targetCFrame)
+        else
+            -- 方法2: 快速平滑传送
+            FastSmoothTeleport(targetCFrame)
+        end
+        
+        -- 方法3: 预测传送 (需要时可启用)
+        -- PredictiveTeleport(TargetPlayer)
+        
+        -- 等待更新间隔
+        task.wait(Config.UpdateRate)
+    end
+end
+
+-- 创建优化版UI (含署名+全设备拖动)
+local function CreateOptimizedUI()
+    -- 销毁现有UI
+    if UI then
+        UI:Destroy()
+        UI = nil
+    end
+    
+    -- 创建主GUI
+    local ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "FastTeleportUI_" .. HttpService:GenerateGUID(false)
+    ScreenGui.Parent = game:GetService("CoreGui")
+    -- 关键：允许手机触摸穿透（但不影响拖动）
+    ScreenGui.IgnoreGuiInset = true
+    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    
+    -- 主容器 (缩小尺寸: 原350x400 → 250x300)
+    local MainFrame = Instance.new("Frame")
+    MainFrame.Size = UDim2.new(0, 250, 0, 300) -- 核心缩小点
+    MainFrame.Position = UDim2.new(0.5, -125, 0.5, -150)
+    MainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+    MainFrame.BorderSizePixel = 0
+    MainFrame.ClipsDescendants = true
+    MainFrame.Parent = ScreenGui
+    
+    -- 收起状态的小面板 (仅显示标题+收起/展开按钮+署名)
+    local FoldFrame = Instance.new("Frame")
+    FoldFrame.Size = UDim2.new(0, 250, 0, 40)
+    FoldFrame.Position = UDim2.new(0, 0, 0, 0)
+    FoldFrame.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+    FoldFrame.BorderSizePixel = 0
+    FoldFrame.Visible = false
+    FoldFrame.Parent = MainFrame
+    
+    -- 圆角
+    local MainCorner = Instance.new("UICorner")
+    MainCorner.CornerRadius = UDim.new(0, 8)
+    MainCorner.Parent = MainFrame
+    
+    local FoldCorner = Instance.new("UICorner")
+    FoldCorner.CornerRadius = UDim.new(0, 8)
+    FoldCorner.Parent = FoldFrame
+    
+    -- 标题栏 (适配小尺寸 + 新增署名)
+    local TitleBar = Instance.new("Frame")
+    TitleBar.Size = UDim2.new(1, 0, 0, 40)
+    TitleBar.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+    TitleBar.BorderSizePixel = 0
+    TitleBar.Parent = MainFrame
+    
+    local TitleCorner = Instance.new("UICorner")
+    TitleCorner.CornerRadius = UDim.new(0, 8)
+    TitleCorner.Parent = TitleBar
+    
+    -- 主标题
+    local Title = Instance.new("TextLabel")
+    Title.Size = UDim2.new(1, -120, 0, 22) -- 留出署名空间
+    Title.Position = UDim2.new(0, 10, 0, 0)
+    Title.BackgroundTransparency = 1
+    Title.Text = "🚀 快速传送器"
+    Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    Title.Font = Enum.Font.GothamBold
+    Title.TextSize = 16 -- 缩小字体
+    Title.TextXAlignment = Enum.TextXAlignment.Left
+    Title.Parent = TitleBar
+
+    -- 新增署名标签 (by 98krgqg)
+    local AuthorLabel = Instance.new("TextLabel")
+    AuthorLabel.Size = UDim2.new(1, -120, 0, 18)
+    AuthorLabel.Position = UDim2.new(0, 10, 0, 22)
+    AuthorLabel.BackgroundTransparency = 1
+    AuthorLabel.Text = "by 98krgqg"
+    AuthorLabel.TextColor3 = Color3.fromRGB(180, 180, 180) -- 浅灰色，不刺眼
+    AuthorLabel.Font = Enum.Font.Gotham
+    AuthorLabel.TextSize = 10 -- 小字体，不占空间
+    AuthorLabel.TextXAlignment = Enum.TextXAlignment.Left
+    AuthorLabel.Parent = TitleBar
+
+    -- 收起/展开按钮 (核心新增)
+    local FoldButton = Instance.new("TextButton")
+    FoldButton.Size = UDim2.new(0, 30, 0, 30)
+    FoldButton.Position = UDim2.new(1, -35, 0, 5)
+    FoldButton.BackgroundColor3 = Color3.fromRGB(70, 70, 80)
+    FoldButton.Text = "−" -- 初始展开状态显示减号
+    FoldButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    FoldButton.Font = Enum.Font.GothamBold
+    FoldButton.TextSize = 18
+    FoldButton.Parent = TitleBar
+    
+    local FoldBtnCorner = Instance.new("UICorner")
+    FoldBtnCorner.CornerRadius = UDim.new(0, 15)
+    FoldBtnCorner.Parent = FoldButton
+
+    -- 收起面板的标题和展开按钮 + 署名
+    local FoldTitle = Instance.new("TextLabel")
+    FoldTitle.Size = UDim2.new(1, -80, 0, 22) -- 留出署名空间
+    FoldTitle.Position = UDim2.new(0, 10, 0, 0)
+    FoldTitle.BackgroundTransparency = 1
+    FoldTitle.Text = "Bypasstp
+    FoldTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+    FoldTitle.Font = Enum.Font.GothamBold
+    FoldTitle.TextSize = 16
+    FoldTitle.TextXAlignment = Enum.TextXAlignment.Left
+    FoldTitle.Parent = FoldFrame
+
+    -- 收起面板的署名
+    local FoldAuthorLabel = Instance.new("TextLabel")
+    FoldAuthorLabel.Size = UDim2.new(1, -80, 0, 18)
+    FoldAuthorLabel.Position = UDim2.new(0, 10, 0, 22)
+    FoldAuthorLabel.BackgroundTransparency = 1
+    FoldAuthorLabel.Text = "by 98krgqg"
+    FoldAuthorLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+    FoldAuthorLabel.Font = Enum.Font.Gotham
+    FoldAuthorLabel.TextSize = 10
+    FoldAuthorLabel.TextXAlignment = Enum.TextXAlignment.Left
+    FoldAuthorLabel.Parent = FoldFrame
+
+    local UnfoldButton = Instance.new("TextButton")
+    UnfoldButton.Size = UDim2.new(0, 30, 0, 30)
+    UnfoldButton.Position = UDim2.new(1, -35, 0, 5)
+    UnfoldButton.BackgroundColor3 = Color3.fromRGB(70, 70, 80)
+    UnfoldButton.Text = "+" -- 收起状态显示加号
+    UnfoldButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    UnfoldButton.Font = Enum.Font.GothamBold
+    UnfoldButton.TextSize = 18
+    UnfoldButton.Parent = FoldFrame
+    
+    local UnfoldBtnCorner = Instance.new("UICorner")
+    UnfoldBtnCorner.CornerRadius = UDim.new(0, 15)
+    UnfoldBtnCorner.Parent = UnfoldButton
+    
+    -- 关闭按钮 (缩小尺寸)
+    local CloseButton = Instance.new("TextButton")
+    CloseButton.Size = UDim2.new(0, 25, 0, 25) -- 缩小
+    CloseButton.Position = UDim2.new(1, -65, 0, 7)
+    CloseButton.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+    CloseButton.Text = "×"
+    CloseButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    CloseButton.Font = Enum.Font.GothamBold
+    CloseButton.TextSize = 16
+    CloseButton.Parent = TitleBar
+    
+    local CloseCorner = Instance.new("UICorner")
+    CloseCorner.CornerRadius = UDim.new(0, 12)
+    CloseCorner.Parent = CloseButton
+    
+    -- 搜索框 (缩小尺寸)
+    local SearchContainer = Instance.new("Frame")
+    SearchContainer.Size = UDim2.new(1, -20, 0, 35) -- 缩小
+    SearchContainer.Position = UDim2.new(0, 10, 0, 45)
+    SearchContainer.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+    SearchContainer.BorderSizePixel = 0
+    SearchContainer.Parent = MainFrame
+    
+    local SearchCorner = Instance.new("UICorner")
+    SearchCorner.CornerRadius = UDim.new(0, 6)
+    SearchCorner.Parent = SearchContainer
+    
+    local SearchBox = Instance.new("TextBox")
+    SearchBox.Size = UDim2.new(1, -40, 1, 0)
+    SearchBox.Position = UDim2.new(0, 8, 0, 0)
+    SearchBox.BackgroundTransparency = 1
+    SearchBox.Text = "搜索玩家..."
+    SearchBox.PlaceholderText = "输入名称"
+    SearchBox.TextColor3 = Color3.fromRGB(200, 200, 200)
+    SearchBox.Font = Enum.Font.Gotham
+    SearchBox.TextSize = 12 -- 缩小字体
+    SearchBox.TextXAlignment = Enum.TextXAlignment.Left
+    SearchBox.ClearTextOnFocus = false
+    SearchBox.Parent = SearchContainer
+    
+    local SearchIcon = Instance.new("ImageLabel")
+    SearchIcon.Size = UDim2.new(0, 16, 0, 16) -- 缩小
+    SearchIcon.Position = UDim2.new(1, -25, 0.5, -8)
+    SearchIcon.BackgroundTransparency = 1
+    SearchIcon.Image = "rbxassetid://3926305904"
+    SearchIcon.ImageRectOffset = Vector2.new(964, 324)
+    SearchIcon.ImageRectSize = Vector2.new(36, 36)
+    SearchIcon.ImageColor3 = Color3.fromRGB(150, 150, 150)
+    SearchIcon.Parent = SearchContainer
+    
+    -- 玩家列表容器 (缩小尺寸)
+    local ListContainer = Instance.new("ScrollingFrame")
+    ListContainer.Size = UDim2.new(1, -20, 0, 140) -- 缩小
+    ListContainer.Position = UDim2.new(0, 10, 0, 85)
+    ListContainer.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+    ListContainer.BorderSizePixel = 0
+    ListContainer.ScrollBarThickness = 3 -- 缩小滚动条
+    ListContainer.ScrollBarImageColor3 = Color3.fromRGB(100, 100, 100)
+    ListContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
+    ListContainer.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    ListContainer.Parent = MainFrame
+    
+    local ListLayout = Instance.new("UIListLayout")
+    ListLayout.Padding = UDim.new(0, 4) -- 缩小间距
+    ListLayout.Parent = ListContainer
+    
+    -- 控制面板 (缩小尺寸)
+    local ControlPanel = Instance.new("Frame")
+    ControlPanel.Size = UDim2.new(1, -20, 0, 80) -- 缩小
+    ControlPanel.Position = UDim2.new(0, 10, 1, -90)
+    ControlPanel.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+    ControlPanel.BorderSizePixel = 0
+    ControlPanel.Parent = MainFrame
+    
+    local ControlCorner = Instance.new("UICorner")
+    ControlCorner.CornerRadius = UDim.new(0, 8)
+    ControlCorner.Parent = ControlPanel
+    
+    -- 状态显示 (缩小字体)
+    local StatusLabel = Instance.new("TextLabel")
+    StatusLabel.Size = UDim2.new(1, -15, 0, 20) -- 缩小
+    StatusLabel.Position = UDim2.new(0, 8, 0, 8)
+    StatusLabel.BackgroundTransparency = 1
+    StatusLabel.Text = "状态: 待机"
+    StatusLabel.TextColor3 = Color3.fromRGB(200, 200, 100)
+    StatusLabel.Font = Enum.Font.Gotham
+    StatusLabel.TextSize = 12 -- 缩小字体
+    StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    StatusLabel.Name = "StatusLabel"
+    StatusLabel.Parent = ControlPanel
+    
+    local TargetLabel = Instance.new("TextLabel")
+    TargetLabel.Size = UDim2.new(1, -15, 0, 18) -- 缩小
+    TargetLabel.Position = UDim2.new(0, 8, 0, 28)
+    TargetLabel.BackgroundTransparency = 1
+    TargetLabel.Text = "目标: 无"
+    TargetLabel.TextColor3 = Color3.fromRGB(170, 170, 255)
+    TargetLabel.Font = Enum.Font.Gotham
+    TargetLabel.TextSize = 11 -- 缩小字体
+    TargetLabel.TextXAlignment = Enum.TextXAlignment.Left
+    TargetLabel.Name = "TargetLabel"
+    TargetLabel.Parent = ControlPanel
+    
+    local DistanceLabel = Instance.new("TextLabel")
+    DistanceLabel.Size = UDim2.new(1, -15, 0, 18) -- 缩小
+    DistanceLabel.Position = UDim2.new(0, 8, 0, 46)
+    DistanceLabel.BackgroundTransparency = 1
+    DistanceLabel.Text = "距离: -"
+    DistanceLabel.TextColor3 = Color3.fromRGB(150, 255, 150)
+    DistanceLabel.Font = Enum.Font.Gotham
+    DistanceLabel.TextSize = 11 -- 缩小字体
+    DistanceLabel.TextXAlignment = Enum.TextXAlignment.Left
+    DistanceLabel.Name = "DistanceLabel"
+    DistanceLabel.Parent = ControlPanel
+    
+    -- 控制按钮 (缩小尺寸)
+    local StartButton = Instance.new("TextButton")
+    StartButton.Size = UDim2.new(0.47, 0, 0, 30) -- 缩小
+    StartButton.Position = UDim2.new(0, 8, 1, -38)
+    StartButton.BackgroundColor3 = Color3.fromRGB(60, 180, 60)
+    StartButton.Text = "▶ 开始"
+    StartButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    StartButton.Font = Enum.Font.GothamBold
+    StartButton.TextSize = 12 -- 缩小字体
+    StartButton.Parent = ControlPanel
+    
+    local StopButton = Instance.new("TextButton")
+    StopButton.Size = UDim2.new(0.47, 0, 0, 30) -- 缩小
+    StopButton.Position = UDim2.new(0.53, 8, 1, -38)
+    StopButton.BackgroundColor3 = Color3.fromRGB(180, 60, 60)
+    StopButton.Text = "■ 停止"
+    StopButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    StopButton.Font = Enum.Font.GothamBold
+    StopButton.TextSize = 12 -- 缩小字体
+    StopButton.Parent = ControlPanel
+    
+    -- 按钮圆角
+    local ButtonCorner1 = Instance.new("UICorner")
+    ButtonCorner1.CornerRadius = UDim.new(0, 5)
+    ButtonCorner1.Parent = StartButton
+    
+    local ButtonCorner2 = Instance.new("UICorner")
+    ButtonCorner2.CornerRadius = UDim.new(0, 5)
+    ButtonCorner2.Parent = StopButton
+    
+    -- ====================== 全设备拖动逻辑 (核心重构) ======================
+    local isDragging = false
+    local dragStartPos = Vector2.new(0, 0)
+    local frameStartPos = UDim2.new(0, 0, 0, 0)
+
+    -- 处理输入开始（兼容鼠标+触摸）
+    local function handleInputBegan(input, gameProcessed)
+        if gameProcessed then return end -- 忽略游戏已处理的输入（比如打字）
+        
+        -- 判定是否为有效拖动起点：鼠标左键 或 触摸
+        local isLeftClick = input.UserInputType == Enum.UserInputType.MouseButton1
+        local isTouch = input.UserInputType == Enum.UserInputType.Touch
+        
+        if (isLeftClick or isTouch) then
+            -- 检查是否点击在标题栏/收起面板上
+            local clickPos = input.Position
+            local titleBarPos = TitleBar.AbsolutePosition
+            local titleBarSize = TitleBar.AbsoluteSize
+            local foldFramePos = FoldFrame.AbsolutePosition
+            local foldFrameSize = FoldFrame.AbsoluteSize
+            
+            local hitTitleBar = (
+                clickPos.X >= titleBarPos.X and clickPos.X <= titleBarPos.X + titleBarSize.X and
+                clickPos.Y >= titleBarPos.Y and clickPos.Y <= titleBarPos.Y + titleBarSize.Y
+            )
+            
+            local hitFoldFrame = (
+                FoldFrame.Visible and
+                clickPos.X >= foldFramePos.X and clickPos.X <= foldFramePos.X + foldFrameSize.X and
+                clickPos.Y >= foldFramePos.Y and clickPos.Y <= foldFramePos.Y + foldFrameSize.Y
+            )
+            
+            if hitTitleBar or hitFoldFrame then
+                isDragging = true
+                dragStartPos = clickPos
+                frameStartPos = MainFrame.Position
+            end
+        end
+    end
+
+    -- 处理输入移动（兼容鼠标+触摸）
+    local function handleInputChanged(input, gameProcessed)
+        if gameProcessed or not isDragging then return end
+        
+        -- 鼠标移动 或 触摸移动
+        local isMouseMove = input.UserInputType == Enum.UserInputType.MouseMovement
+        local isTouchMove = input.UserInputType == Enum.UserInputType.Touch
+        
+        if (isMouseMove or isTouchMove) then
+            local currentPos = input.Position
+            local deltaX = currentPos.X - dragStartPos.X
+            local deltaY = currentPos.Y - dragStartPos.Y
+            
+            -- 更新UI位置
+            MainFrame.Position = UDim2.new(
+                frameStartPos.X.Scale,
+                frameStartPos.X.Offset + deltaX,
+                frameStartPos.Y.Scale,
+                frameStartPos.Y.Offset + deltaY
+            )
+        end
+    end
+
+    -- 处理输入结束（兼容鼠标+触摸）
+    local function handleInputEnded(input, gameProcessed)
+        if gameProcessed then return end
+        
+        local isLeftClickEnd = input.UserInputType == Enum.UserInputType.MouseButton1
+        local isTouchEnd = input.UserInputType == Enum.UserInputType.Touch
+        
+        if (isLeftClickEnd or isTouchEnd) then
+            isDragging = false
+        end
+    end
+
+    -- 绑定全局输入事件
+    UserInputService.InputBegan:Connect(handleInputBegan)
+    UserInputService.InputChanged:Connect(handleInputChanged)
+    UserInputService.InputEnded:Connect(handleInputEnded)
+    -- ====================== 拖动逻辑重构结束 ======================
+    
+    -- 收起/展开逻辑 (核心新增)
+    local function ToggleFold()
+        UIFolded = not UIFolded
+        
+        if UIFolded then
+            -- 收起状态: 隐藏主内容，显示小面板
+            TitleBar.Visible = false
+            SearchContainer.Visible = false
+            ListContainer.Visible = false
+            ControlPanel.Visible = false
+            FoldFrame.Visible = true
+            MainFrame.Size = UDim2.new(0, 250, 0, 40) -- 仅显示小面板
+            FoldButton.Text = "+"
+        else
+            -- 展开状态: 显示所有内容，恢复原尺寸
+            FoldFrame.Visible = false
+            TitleBar.Visible = true
+            SearchContainer.Visible = true
+            ListContainer.Visible = true
+            ControlPanel.Visible = true
+            MainFrame.Size = UDim2.new(0, 250, 0, 300) -- 恢复缩小后的尺寸
+            FoldButton.Text = "−"
+        end
+    end
+
+    -- 绑定收起/展开按钮
+    FoldButton.MouseButton1Click:Connect(ToggleFold)
+    UnfoldButton.MouseButton1Click:Connect(ToggleFold)
+    
+    -- 按钮事件
+    CloseButton.MouseButton1Click:Connect(function()
+        ScreenGui:Destroy()
+        UI = nil
+    end)
+    
+    StartButton.MouseButton1Click:Connect(function()
+        if TargetPlayer then
+            StartTeleport()
+        else
+            ShowNotification("错误", "请先选择目标玩家", 2)
+        end
+    end)
+    
+    StopButton.MouseButton1Click:Connect(function()
+        StopTeleport()
+    end)
+    
+    -- 搜索功能 (保留原有逻辑)
+    local function FilterPlayers(searchText)
+        local players = GetOnlinePlayers()
+        local filtered = {}
+        
+        if searchText == "" or searchText == "搜索玩家..." then
+            return players
+        end
+        
+        for _, player in ipairs(players) do
+            if string.find(string.lower(player.Name), string.lower(searchText)) then
+                table.insert(filtered, player)
+            end
+        end
+        
+        return filtered
+    end
+    
+    SearchBox.FocusLost:Connect(function(enterPressed)
+        UpdatePlayerList()
+    end)
+    
+    SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
+        UpdatePlayerList()
+    end)
+    
+    -- 更新玩家列表函数 (适配小尺寸)
+    local function UpdatePlayerList()
+        -- 清除现有项
+        for _, child in ipairs(ListContainer:GetChildren()) do
+            if child:IsA("Frame") then
+                child:Destroy()
+            end
+        end
+        
+        -- 获取过滤后的玩家
+        local searchText = SearchBox.Text
+        PlayersList = FilterPlayers(searchText)
+        
+        -- 创建玩家项 (缩小尺寸)
+        for _, player in ipairs(PlayersList) do
+            local PlayerItem = Instance.new("Frame")
+            PlayerItem.Size = UDim2.new(1, 0, 0, 40) -- 缩小
+            PlayerItem.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+            PlayerItem.BorderSizePixel = 0
+            PlayerItem.Name = player.Name
+            PlayerItem.Parent = ListContainer
+            
+            local ItemCorner = Instance.new("UICorner")
+            ItemCorner.CornerRadius = UDim.new(0, 5)
+            ItemCorner.Parent = PlayerItem
+            
+            local PlayerName = Instance.new("TextLabel")
+            PlayerName.Size = UDim2.new(1, -50, 0, 20) -- 缩小
+            PlayerName.Position = UDim2.new(0, 8, 0, 4)
+            PlayerName.BackgroundTransparency = 1
+            PlayerName.Text = player.Name
+            PlayerName.TextColor3 = Color3.fromRGB(255, 255, 255)
+            PlayerName.Font = Enum.Font.GothamBold
+            PlayerName.TextSize = 14 -- 缩小字体
+            PlayerName.TextXAlignment = Enum.TextXAlignment.Left
+            PlayerName.Parent = PlayerItem
+            
+            local PlayerDisplay = Instance.new("TextLabel")
+            PlayerDisplay.Size = UDim2.new(1, -50, 0, 16) -- 缩小
+            PlayerDisplay.Position = UDim2.new(0, 8, 0, 24)
+            PlayerDisplay.BackgroundTransparency = 1
+            PlayerDisplay.Text = "@" .. player.DisplayName
+            PlayerDisplay.TextColor3 = Color3.fromRGB(180, 180, 180)
+            PlayerDisplay.Font = Enum.Font.Gotham
+            PlayerDisplay.TextSize = 10 -- 缩小字体
+            PlayerDisplay.TextXAlignment = Enum.TextXAlignment.Left
+            PlayerDisplay.Parent = PlayerItem
+            
+            local SelectButton = Instance.new("TextButton")
+            SelectButton.Size = UDim2.new(0, 35, 0, 30) -- 缩小
+            SelectButton.Position = UDim2.new(1, -43, 0.5, -15)
+            SelectButton.BackgroundColor3 = Color3.fromRGB(70, 70, 180)
+            SelectButton.Text = "选"
+            SelectButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+            SelectButton.Font = Enum.Font.Gotham
+            SelectButton.TextSize = 11 -- 缩小字体
+            SelectButton.Parent = PlayerItem
+            
+            local SelectCorner = Instance.new("UICorner")
+            SelectCorner.CornerRadius = UDim.new(0, 5)
+            SelectCorner.Parent = SelectButton
+            
+            -- 选中状态指示器
+            local SelectedIndicator = Instance.new("Frame")
+            SelectedIndicator.Size = UDim2.new(1, 0, 0, 2) -- 缩小
+            SelectedIndicator.Position = UDim2.new(0, 0, 1, -2)
+            SelectedIndicator.BackgroundColor3 = Color3.fromRGB(100, 200, 255)
+            SelectedIndicator.BorderSizePixel = 0
+            SelectedIndicator.Visible = (player == TargetPlayer)
+            SelectedIndicator.Name = "SelectedIndicator"
+            SelectedIndicator.Parent = PlayerItem
+            
+            -- 选择按钮点击事件
+            SelectButton.MouseButton1Click:Connect(function()
+                TargetPlayer = player
+                UpdatePlayerList() -- 更新选择状态
+                UpdateUIStatus()
+                ShowNotification("目标已选择", "当前目标: " .. player.Name, 2)
+            end)
+        end
+    end
+    
+    -- 更新UI状态函数 (适配收起/展开)
+    local function UpdateUIStatus()
+        if StatusLabel then
+            StatusLabel.Text = "状态: " .. (Teleporting and "传送中" or "待机")
+            StatusLabel.TextColor3 = Teleporting and Color3.fromRGB(100, 255, 100) or Color3.fromRGB(200, 200, 100)
+        end
+        
+        if TargetLabel then
+            TargetLabel.Text = "目标: " .. (TargetPlayer and TargetPlayer.Name or "无")
+        end
+        
+        if DistanceLabel and TargetPlayer and Config.ShowDistance then
+            local distance = GetDistance(LocalPlayer, TargetPlayer)
+            DistanceLabel.Text = "距离: " .. string.format("%.1f", distance) .. " 米"
+        end
+        
+        -- 更新列表中的选中状态
+        for _, child in ipairs(ListContainer:GetChildren()) do
+            if child:IsA("Frame") then
+                local indicator = child:FindFirstChild("SelectedIndicator")
+                if indicator then
+                    indicator.Visible = (child.Name == (TargetPlayer and TargetPlayer.Name or ""))
+                end
+            end
+        end
+    end
+    
+    -- 初始化
+    UpdatePlayerList()
+    UpdateUIStatus()
+    
+    -- 定时更新距离
+    local distanceUpdate = RunService.Heartbeat:Connect(function()
+        if TargetPlayer and Config.ShowDistance and DistanceLabel then
+            local distance = GetDistance(LocalPlayer, TargetPlayer)
+            DistanceLabel.Text = "距离: " .. string.format("%.1f", distance) .. " 米"
+        end
+    end)
+    
+    -- 玩家加入/离开事件
+    local function OnPlayerAdded(player)
+        task.wait(1) -- 等待玩家加载
+        UpdatePlayerList()
+    end
+    
+    local function OnPlayerRemoving(player)
+        if player == TargetPlayer then
+            TargetPlayer = nil
+            if Teleporting then
+                StopTeleport()
+                ShowNotification("目标丢失", "目标玩家已离开", 2)
+            end
+        end
+        UpdatePlayerList()
+    end
+    
+    Players.PlayerAdded:Connect(OnPlayerAdded)
+    Players.PlayerRemoving:Connect(OnPlayerRemoving)
+    
+    -- 返回UI和更新函数
+    return ScreenGui, UpdateUIStatus, UpdatePlayerList
+end
+
+-- 开始传送
+function StartTeleport()
+    if not TargetPlayer then
+        ShowNotification("错误", "请先选择目标玩家", 2)
+        return
+    end
+    
+    if not TargetPlayer.Character then
+        ShowNotification("错误", "目标玩家没有角色", 2)
+        return
+    end
+    
+    if Teleporting then
+        ShowNotification("提示", "已经在传送中", 2)
+        return
+    end
+    
+    Teleporting = true
+    ShowNotification("传送开始", "目标: " .. TargetPlayer.Name, 2)
+    
+    -- 启动传送循环
+    MainLoop = RunService.Heartbeat:Connect(function()
+        if not Teleporting or not TargetPlayer or not TargetPlayer.Character then
+            if Teleporting then
+                StopTeleport()
+            end
+            return
+        end
+        
+        local targetChar = TargetPlayer.Character
+        local targetHRP = targetChar:FindFirstChild("HumanoidRootPart")
+        
+        if not targetHRP then
+            return
+        end
+        
+        -- 快速直接传送
+        local targetPosition = targetHRP.Position + Vector3.new(0, Config.TeleportHeight, 0)
+        local lookVector = (targetPosition - (HumanoidRootPart and HumanoidRootPart.Position or Vector3.new(0,0,0))).Unit
+        local targetCFrame = CFrame.new(targetPosition, targetPosition + lookVector)
+        
+        if HumanoidRootPart then
+            HumanoidRootPart.CFrame = targetCFrame
+        end
+    end)
+    
+    if UI then
+        UpdateUIStatus()
+    end
+end
+
+-- 停止传送
+function StopTeleport()
+    if not Teleporting then
+        return
+    end
+    
+    Teleporting = false
+    
+    if MainLoop then
+        MainLoop:Disconnect()
+        MainLoop = nil
+    end
+    
+    ShowNotification("传送停止", "已停止传送", 2)
+    
+    if UI then
+        UpdateUIStatus()
+    end
+end
+
+-- 初始化
+task.wait(1) -- 等待完全加载
+
+-- 创建优化版UI
+UI, UpdateUIStatus, UpdatePlayerList = CreateOptimizedUI()
+
+-- 显示欢迎信息 (新增署名提示)
+ShowNotification("快速传送脚本已加载", 
+    "功能说明:\n" ..
+    "1. 从列表选择玩家\n" ..
+    "2. 点击开始/停止传送\n" ..
+    "3. 点击−/+/×收起/展开/关闭\n" ..
+    "4. 拖动标题栏/小面板可移动UI\n" ..
+    "5. 支持手机触摸拖动\n" ..
+    "by 98krgqg | 传送速度: " .. Config.TeleportSpeed, 
+    6
+)
+
+-- 角色重生处理
+LocalPlayer.CharacterAdded:Connect(function(newChar)
+    Character = newChar
+    task.wait(0.5) -- 等待角色完全加载
+    HumanoidRootPart = newChar:WaitForChild("HumanoidRootPart")
+    
+    if Teleporting and Config.AutoRespawn then
+        ShowNotification("自动恢复", "角色重生后继续传送", 2)
+        task.wait(1)
+        if TargetPlayer then
+            Teleporting = true
+        end
+    end
+end)
+
+-- 主循环
+while task.wait(1) do
+    if Teleporting and (not TargetPlayer or not TargetPlayer.Character) then
+        StopTeleport()
+    end
+    
+    -- 每5秒刷新一次玩家列表
+    if tick() % 5 < 1 then
+        UpdatePlayerList()
+    end
+end
