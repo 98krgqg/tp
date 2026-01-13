@@ -1,4 +1,3 @@
-
 -- 服务
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -17,7 +16,7 @@ local Config = {
     TeleportSpeed = 200,         -- 传送速度 (越大越快)
     TeleportHeight = 3,          -- 高度偏移
     Smoothness = 0.15,           -- 平滑度 (0-1, 越小越平滑)
-    UpdateRate = 0.016,          -- 更新频率 (秒)
+    UpdateRate = 0.02,           -- 更新频率 (秒) - 已修改为0.02秒
     ShowDistance = true,         -- 显示距离
     AutoRespawn = true,          -- 自动重生后重新开始
     UseCFrameMethod = true,      -- 使用CFrame方法 (更稳定)
@@ -32,6 +31,8 @@ local CurrentIndex = 1
 local UI = nil
 local MainLoop = nil
 local UIFolded = false -- UI收起/展开状态
+local UpdateUIStatus = nil -- 初始化更新UI函数引用
+local UpdatePlayerList = nil -- 初始化更新列表函数引用
 
 -- 工具函数
 local function PrintDebug(msg)
@@ -174,7 +175,7 @@ local function TeleportLoop()
         -- 方法3: 预测传送 (需要时可启用)
         -- PredictiveTeleport(TargetPlayer)
         
-        -- 等待更新间隔
+        -- 等待更新间隔 (使用精确的等待时间)
         task.wait(Config.UpdateRate)
     end
 end
@@ -277,7 +278,7 @@ local function CreateOptimizedUI()
     FoldTitle.Size = UDim2.new(1, -80, 0, 22) -- 留出署名空间
     FoldTitle.Position = UDim2.new(0, 10, 0, 0)
     FoldTitle.BackgroundTransparency = 1
-    FoldTitle.Text = "Bypasstp
+    FoldTitle.Text = "Bypasstp" -- 修复字符串未闭合的错误
     FoldTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
     FoldTitle.Font = Enum.Font.GothamBold
     FoldTitle.TextSize = 16
@@ -610,7 +611,7 @@ local function CreateOptimizedUI()
     end)
     
     -- 更新玩家列表函数 (适配小尺寸)
-    local function UpdatePlayerList()
+    UpdatePlayerList = function()
         -- 清除现有项
         for _, child in ipairs(ListContainer:GetChildren()) do
             if child:IsA("Frame") then
@@ -692,7 +693,7 @@ local function CreateOptimizedUI()
     end
     
     -- 更新UI状态函数 (适配收起/展开)
-    local function UpdateUIStatus()
+    UpdateUIStatus = function()
         if StatusLabel then
             StatusLabel.Text = "状态: " .. (Teleporting and "传送中" or "待机")
             StatusLabel.TextColor3 = Teleporting and Color3.fromRGB(100, 255, 100) or Color3.fromRGB(200, 200, 100)
@@ -774,7 +775,12 @@ function StartTeleport()
     Teleporting = true
     ShowNotification("传送开始", "目标: " .. TargetPlayer.Name, 2)
     
-    -- 启动传送循环
+    -- 启动传送循环 (使用精确的0.02秒间隔)
+    if MainLoop then
+        MainLoop:Disconnect()
+        MainLoop = nil
+    end
+    
     MainLoop = RunService.Heartbeat:Connect(function()
         if not Teleporting or not TargetPlayer or not TargetPlayer.Character then
             if Teleporting then
@@ -839,7 +845,7 @@ ShowNotification("快速传送脚本已加载",
     "3. 点击−/+/×收起/展开/关闭\n" ..
     "4. 拖动标题栏/小面板可移动UI\n" ..
     "5. 支持手机触摸拖动\n" ..
-    "by 98krgqg | 传送速度: " .. Config.TeleportSpeed, 
+    "by 98krgqg | 传送间隔: " .. Config.UpdateRate .. "秒", 
     6
 )
 
@@ -865,7 +871,7 @@ while task.wait(1) do
     end
     
     -- 每5秒刷新一次玩家列表
-    if tick() % 5 < 1 then
+    if math.floor(tick()) % 5 == 0 then -- 修复tick()取模的精度问题
         UpdatePlayerList()
     end
 end
