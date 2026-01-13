@@ -239,7 +239,7 @@ local function CreateOptimizedUI()
     Title.Size = UDim2.new(1, -120, 0, 22) -- 留出署名空间
     Title.Position = UDim2.new(0, 10, 0, 0)
     Title.BackgroundTransparency = 1
-    Title.Text = "🚀 快速传送器"
+    Title.Text = "Bypasstp"
     Title.TextColor3 = Color3.fromRGB(255, 255, 255)
     Title.Font = Enum.Font.GothamBold
     Title.TextSize = 16 -- 缩小字体
